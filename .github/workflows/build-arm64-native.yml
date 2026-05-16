@@ -132,6 +132,7 @@ jobs:
           TAG="v${VERSION}-arm64-native${XNNPACK_SUFFIX}"
 
           gh release create "$TAG" \
+            --repo "${{ github.repository }}" \
             --title "ORT ${VERSION} ARM64 Native${XNNPACK_SUFFIX}" \
             --notes "Native ARM64 build of ONNX Runtime ${VERSION}.
 
