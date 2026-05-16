@@ -1,0 +1,144 @@
+name: Build ORT ARM64 Native
+
+on:
+  workflow_dispatch:
+    inputs:
+      ort_version:
+        description: 'ONNX Runtime version tag (e.g. v1.25.1)'
+        required: true
+        default: 'v1.25.1'
+      build_xnnpack:
+        description: 'Include XNNPACK EP'
+        type: boolean
+        default: true
+
+jobs:
+  build-arm64-native:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          df -h /
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential cmake ninja-build git python3 python3-pip \
+            python3-numpy libssl-dev
+
+      - name: Checkout ONNX Runtime
+        uses: actions/checkout@v4
+        with:
+          repository: microsoft/onnxruntime
+          ref: ${{ github.event.inputs.ort_version }}
+          submodules: recursive
+
+      - name: Build ONNX Runtime (native ARM64)
+        run: |
+          EXTRA_FLAGS=""
+          if [ "${{ github.event.inputs.build_xnnpack }}" = "true" ]; then
+            EXTRA_FLAGS="--use_xnnpack"
+          fi
+
+          ./build.sh \
+            --config Release \
+            --parallel $(nproc) \
+            --build_shared_lib \
+            --skip_tests \
+            --compile_no_warning_as_error \
+            --cmake_extra_defines \
+              onnxruntime_BUILD_UNIT_TESTS=OFF \
+              onnxruntime_BUILD_BENCHMARKS=OFF \
+              CMAKE_SHARED_LINKER_FLAGS="-static-libstdc++ -static-libgcc" \
+            $EXTRA_FLAGS
+
+      - name: Verify FP16 symbols
+        run: |
+          LIB=$(find build -name 'libonnxruntime.so*' -not -name '*.a' | head -1)
+          echo "Library: $LIB"
+          echo "Size: $(du -h $LIB | cut -f1)"
+          echo ""
+          echo "=== FP16/Half GEMM symbols ==="
+          nm -D $LIB | grep -i "half\|fp16\|hgemm" || echo "No FP16 symbols found"
+          echo ""
+          echo "=== MLAS symbols ==="
+          nm -D $LIB | grep -i "MlasHalf" || echo "No MlasHalf symbols"
+          echo ""
+          echo "=== Dependencies ==="
+          ldd $LIB
+          echo ""
+          echo "=== File info ==="
+          file $LIB
+
+      - name: Package artifact
+        run: |
+          LIB=$(find build -name 'libonnxruntime.so*' -not -name '*.a' | head -1)
+          VERSION="${{ github.event.inputs.ort_version }}"
+          VERSION="${VERSION#v}"
+
+          XNNPACK_SUFFIX=""
+          if [ "${{ github.event.inputs.build_xnnpack }}" = "true" ]; then
+            XNNPACK_SUFFIX="-xnnpack"
+          fi
+
+          ARTIFACT_NAME="onnxruntime-${VERSION}-linux-aarch64-native${XNNPACK_SUFFIX}"
+          mkdir -p "$ARTIFACT_NAME/lib" "$ARTIFACT_NAME/include"
+
+          cp $LIB "$ARTIFACT_NAME/lib/libonnxruntime.so.${VERSION}"
+          ln -s "libonnxruntime.so.${VERSION}" "$ARTIFACT_NAME/lib/libonnxruntime.so"
+
+          cp -r include/onnxruntime/core/session/*.h "$ARTIFACT_NAME/include/" 2>/dev/null || true
+          cp include/onnxruntime/core/providers/cpu/*.h "$ARTIFACT_NAME/include/" 2>/dev/null || true
+
+          cat > "$ARTIFACT_NAME/BUILD-INFO.md" << 'EOF'
+          # ONNX Runtime Native ARM64 Build
+
+          Built natively on ARM64 (not cross-compiled) to ensure CMake
+          FP16 capability detection runs correctly on the target architecture.
+
+          This fixes the issue where cross-compiled builds insert Cast(fp16->fp32)
+          nodes in the graph optimizer instead of routing to native FP16 MatMul
+          (MlasHalfGemmBatch).
+
+          See: https://github.com/microsoft/onnxruntime/issues/25824
+          EOF
+
+          tar czf "${ARTIFACT_NAME}.tar.gz" "$ARTIFACT_NAME"
+          echo "ARTIFACT_NAME=${ARTIFACT_NAME}" >> $GITHUB_ENV
+          echo "ARTIFACT_FILE=${ARTIFACT_NAME}.tar.gz" >> $GITHUB_ENV
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ env.ARTIFACT_FILE }}
+          retention-days: 90
+
+      - name: Create release
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ github.event.inputs.ort_version }}"
+          VERSION="${VERSION#v}"
+          XNNPACK_SUFFIX=""
+          if [ "${{ github.event.inputs.build_xnnpack }}" = "true" ]; then
+            XNNPACK_SUFFIX="-xnnpack"
+          fi
+          TAG="v${VERSION}-arm64-native${XNNPACK_SUFFIX}"
+
+          gh release create "$TAG" \
+            --title "ORT ${VERSION} ARM64 Native${XNNPACK_SUFFIX}" \
+            --notes "Native ARM64 build of ONNX Runtime ${VERSION}.
+
+          Built on GitHub ARM64 runner (ubuntu-24.04-arm) to ensure proper FP16 MLAS detection.
+
+          Includes: CPU EP$([ '${{ github.event.inputs.build_xnnpack }}' = 'true' ] && echo ' + XNNPACK EP'), ARM NEON, KleidiAI.
+          Static libstdc++/libgcc (no GLIBCXX dependency).
+
+          Fixes: https://github.com/microsoft/onnxruntime/issues/25824" \
+            "${{ env.ARTIFACT_FILE }}"
